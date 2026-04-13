@@ -1,6 +1,10 @@
 //! `cachee plan` / `cachee usage` — pricing, billing, metering.
+//!
+//! When signed in: talks to cachee.ai API for real usage data.
+//! When not signed in: shows local config only.
 
 use crate::config;
+use crate::signup;
 
 pub async fn show() -> anyhow::Result<()> {
     let cfg = config::load()?;
@@ -65,7 +69,47 @@ pub async fn upgrade(tier: &str) -> anyhow::Result<()> {
     let toml_str = toml::to_string_pretty(&cfg)?;
     std::fs::write(&config_path, &toml_str)?;
 
-    println!("Upgraded to: {tier}");
+    // If signed in, call the API to get a Stripe checkout URL
+    if let Some(creds) = signup::load_credentials() {
+        println!("Upgrading to: {tier}");
+        println!();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post("https://cachee.ai/.netlify/functions/cachee-plan")
+            .json(&serde_json::json!({
+                "api_key": creds.api_key,
+                "action": "upgrade",
+                "tier": tier,
+            }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    if let Some(url) = body["checkout_url"].as_str() {
+                        println!("  Complete your upgrade:");
+                        println!("  {url}");
+                        println!();
+                        // Try to open in browser
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open").arg(url).spawn();
+                        #[cfg(target_os = "linux")]
+                        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                        println!("  (opening in browser...)");
+                    }
+                }
+            }
+            _ => {
+                println!("  Could not reach cachee.ai — applying locally.");
+            }
+        }
+    } else {
+        println!("Upgraded locally to: {tier}");
+        println!("  Sign up to sync: cachee signup --email you@example.com");
+    }
+
     println!();
     println!("  Ops/month      : {}", format_ops(ops));
     println!("  Rate per op    : $0.000005");

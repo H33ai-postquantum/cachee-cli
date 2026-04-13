@@ -48,6 +48,9 @@ prometheus = "0.13"
 # Benchmarking
 hdrhistogram = "7.5"
 
+# HTTP client (for signup/usage/plan API calls)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
 # Process management
 libc = "0.2"
 anyhow = "1.0"

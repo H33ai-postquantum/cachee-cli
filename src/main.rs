@@ -36,6 +36,7 @@ mod plan;
 mod security;
 mod diagnostics;
 mod data;
+mod signup;
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +52,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // ── Account ────────────────────────────────────────
+    /// Create a Cachee account
+    Signup {
+        /// Your email address
+        #[arg(long)]
+        email: String,
+    },
+    /// Verify your email with the code you received
+    Verify {
+        /// Verification code
+        #[arg(long)]
+        code: String,
+        /// Email (auto-detected from pending signup)
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Show your account info
+    Whoami,
+    /// Log out and remove credentials
+    Logout,
+
+    // ── Setup ─────────────────────────────────────────
     /// Initialize Cachee — create config, generate PQ keypair
     Init {
         /// Port for RESP server
@@ -310,6 +333,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // Account
+        Commands::Signup { email } => signup::signup(&email).await?,
+        Commands::Verify { code, email } => signup::verify(email.as_deref(), &code).await?,
+        Commands::Whoami => signup::whoami().await?,
+        Commands::Logout => signup::logout().await?,
+
         // Lifecycle
         Commands::Init { port, max_keys, ttl } => config::init(port, max_keys, ttl).await?,
         Commands::Start { foreground, config: config_path } => daemon::start(foreground, config_path).await?,
