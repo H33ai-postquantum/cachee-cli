@@ -77,3 +77,42 @@ pub async fn del(key: &str) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+pub async fn ttl(key: &str) -> anyhow::Result<()> {
+    let mut stream = connect().await?;
+    let cmd = format!("TTL {key}\r\n");
+    stream.write_all(cmd.as_bytes()).await?;
+
+    let mut buf = vec![0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    // Parse RESP integer ":NNN\r\n"
+    if let Some(val) = response.strip_prefix(':') {
+        let secs = val.trim().parse::<i64>().unwrap_or(-2);
+        match secs {
+            -2 => println!("(key does not exist)"),
+            -1 => println!("(no expiry)"),
+            s => println!("(integer) {s} seconds"),
+        }
+    } else {
+        println!("{}", response.trim());
+    }
+
+    Ok(())
+}
+
+pub async fn keys(pattern: &str, limit: usize) -> anyhow::Result<()> {
+    let mut stream = connect().await?;
+    let cmd = format!("KEYS {pattern}\r\n");
+    stream.write_all(cmd.as_bytes()).await?;
+
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    println!("{}", response.trim());
+    println!("(limit: {limit})");
+
+    Ok(())
+}
