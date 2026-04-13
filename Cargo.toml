@@ -1,0 +1,60 @@
+[package]
+name = "cachee-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Eric Beans <eric@cachee.ai>"]
+description = "Cachee CLI — the world's first post-quantum caching service"
+license = "MIT"
+repository = "https://github.com/H33ai-postquantum/cachee-cli"
+homepage = "https://cachee.ai/pq-cache"
+keywords = ["cache", "post-quantum", "cachee", "cli", "redis"]
+categories = ["caching", "command-line-utilities", "cryptography"]
+
+[[bin]]
+name = "cachee"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap = { version = "4", features = ["derive", "color"] }
+
+# Cache engine (statically linked from GitLab private repo at build time)
+# For local dev: path = "../cachee-netlify-clean/rust-core"
+# For release: published to private registry or vendored
+cachee-core = { path = "../cachee-netlify-clean/rust-core" }
+
+# RESP protocol server (Redis-compatible)
+tokio = { version = "1.35", features = ["full"] }
+bytes = "1.5"
+
+# PQ attestation (Substrate signing)
+sha3 = "0.10"
+rand = "0.8"
+hex = "0.4"
+
+# Config
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Metrics
+prometheus = "0.13"
+
+# Benchmarking
+hdrhistogram = "7.5"
+
+# Process management
+libc = "0.2"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
