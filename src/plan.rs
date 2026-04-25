@@ -26,16 +26,18 @@ pub async fn show() -> anyhow::Result<()> {
 pub async fn list() -> anyhow::Result<()> {
     println!("Cachee Plans");
     println!();
-    println!("  {:<16} {:<16} {:<14} {:<14} {:<12}", "Tier", "Ops/month", "Rate/op", "Price/month", "Features");
-    println!("  {}", "-".repeat(75));
-    println!("  {:<16} {:<16} {:<14} {:<14} {:<12}", "free",          "10M",   "—",          "$0",        "L0+L1, CacheeLFU");
-    println!("  {:<16} {:<16} {:<14} {:<14} {:<12}", "starter",       "100M",  "$0.000005",  "$50",       "+ PQ attest");
-    println!("  {:<16} {:<16} {:<14} {:<14} {:<12}", "professional",  "1B",    "$0.000005",  "$499",      "+ TLS, auth keys");
-    println!("  {:<16} {:<16} {:<14} {:<14} {:<12}", "enterprise",    "10B+",  "$0.000005",  "$2,499",    "+ D-Cachee, SLA");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "Tier", "Ops/month", "Rate/1M", "Price/month", "Features");
+    println!("  {}", "-".repeat(80));
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "free",                "1M (trial)", "—",     "$0",       "L0+L1, CacheeLFU");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "payg",                "Usage-based", "$15",  "Usage",    "Full analytics");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "starter",             "20M",    "$9.95",     "$199",     "+ PQ attest");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "scale",               "200M",   "$5.00",     "$999",     "+ Sidecar, 5 regions");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "institutional",       "10B",    "$1.00",     "$9,999",   "+ Dedicated AM, SLA");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "institutional-plus",  "50B",    "$0.50",     "$24,999",  "+ Dedicated infra");
+    println!("  {:<20} {:<14} {:<12} {:<14} {:<18}", "unlimited",           "No cap", "—",         "$99,999",  "10TB mem, custom SLA");
     println!();
-    println!("  All paid plans: $0.000005 per op (5e-6). Flat rate, any volume.");
-    println!("  PQ attestation included on all paid plans.");
-    println!("  On-chain anchoring (Bitcoin/Solana/Ethereum) billed at chain gas cost.");
+    println!("  Unlimited: $99,999/mo includes 10TB memory. $5,000/TB/mo beyond.");
+    println!("  PQ attestation included on Starter and above.");
     println!();
     println!("  Upgrade: cachee plan upgrade starter");
 
@@ -43,16 +45,19 @@ pub async fn list() -> anyhow::Result<()> {
 }
 
 pub async fn upgrade(tier: &str) -> anyhow::Result<()> {
-    let valid = ["starter", "professional", "enterprise"];
+    let valid = ["payg", "starter", "scale", "institutional", "institutional-plus", "unlimited"];
     if !valid.contains(&tier) {
-        anyhow::bail!("Unknown tier '{}'. Valid tiers: {}", tier, valid.join(", "));
+        anyhow::bail!("Unknown tier '{}'. Valid: {}", tier, valid.join(", "));
     }
 
     let mut cfg = config::load()?;
     let (ops, rate, price) = match tier {
-        "starter" => (100_000_000u64, 0.000005, "$50/month"),
-        "professional" => (1_000_000_000, 0.000005, "$499/month"),
-        "enterprise" => (10_000_000_000, 0.000005, "$2,499/month"),
+        "payg" => (0u64, 0.000015, "$15/1M (usage-based)"),
+        "starter" => (20_000_000, 0.00000995, "$199/month"),
+        "scale" => (200_000_000, 0.000005, "$999/month"),
+        "institutional" => (10_000_000_000, 0.000001, "$9,999/month"),
+        "institutional-plus" => (50_000_000_000, 0.0000005, "$24,999/month"),
+        "unlimited" => (u64::MAX, 0.0, "$99,999/month"),
         _ => unreachable!(),
     };
 
@@ -60,8 +65,17 @@ pub async fn upgrade(tier: &str) -> anyhow::Result<()> {
     cfg.plan.ops_per_month = ops;
     cfg.plan.rate_per_op = rate;
 
+    // Memory cap and overage for unlimited
+    if tier == "unlimited" {
+        cfg.plan.memory_cap_tb = 10.0;
+        cfg.plan.overage_per_tb = 5000.0;
+    } else {
+        cfg.plan.memory_cap_tb = 0.0;
+        cfg.plan.overage_per_tb = 0.0;
+    }
+
     // Enable attestation on paid plans
-    if tier != "free" {
+    if tier != "free" && tier != "payg" {
         cfg.attest_enabled = true;
     }
 
@@ -126,63 +140,127 @@ pub async fn usage() -> anyhow::Result<()> {
 
     // Try to get live stats from daemon
     let addr = format!("127.0.0.1:{}", cfg.port);
-    let live_ops = match tokio::net::TcpStream::connect(&addr).await {
+    let (live_ops, memory_bytes, keys, hit_rate) = match tokio::net::TcpStream::connect(&addr).await {
         Ok(mut stream) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             stream.write_all(b"INFO\r\n").await?;
-            let mut buf = vec![0u8; 4096];
+            let mut buf = vec![0u8; 8192];
             let n = stream.read(&mut buf).await?;
             let info = String::from_utf8_lossy(&buf[..n]);
-            // Parse total_ops from INFO response
-            info.lines()
-                .find(|l| l.starts_with("total_ops:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
+            let get_val = |key: &str| -> u64 {
+                info.lines()
+                    .find(|l| l.starts_with(key))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0)
+            };
+            let get_f64 = |key: &str| -> f64 {
+                info.lines()
+                    .find(|l| l.starts_with(key))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0.0)
+            };
+            (get_val("total_ops:"), get_val("used_memory:"), get_val("total_keys:"), get_f64("hit_rate:"))
         }
-        Err(_) => 0,
+        Err(_) => (0, 0, 0, 0.0),
     };
 
-    let pct_used = if cfg.plan.ops_per_month > 0 {
-        live_ops as f64 / cfg.plan.ops_per_month as f64 * 100.0
-    } else {
-        0.0
-    };
-
-    let overage_ops = if live_ops > cfg.plan.ops_per_month {
-        live_ops - cfg.plan.ops_per_month
-    } else {
-        0
-    };
-    let overage_cost = overage_ops as f64 * cfg.plan.rate_per_op;
+    let memory_gb = memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let memory_tb = memory_gb / 1024.0;
 
     println!("Cachee Usage");
     println!();
     println!("  Plan           : {}", cfg.plan.tier);
-    println!("  Ops this cycle : {}", format_ops(live_ops));
-    println!("  Limit          : {}", format_ops(cfg.plan.ops_per_month));
-    println!("  Used           : {:.2}%", pct_used);
 
-    // Progress bar
-    let bar_width = 40;
-    let filled = (pct_used / 100.0 * bar_width as f64).min(bar_width as f64) as usize;
-    let empty = bar_width - filled;
-    println!("  [{}{}]", "#".repeat(filled), "-".repeat(empty));
+    // Ops section
+    if cfg.plan.ops_per_month == u64::MAX {
+        println!("  Ops this cycle : {} (no cap)", format_ops(live_ops));
+    } else if cfg.plan.ops_per_month > 0 {
+        let pct_used = live_ops as f64 / cfg.plan.ops_per_month as f64 * 100.0;
+        println!("  Ops this cycle : {}", format_ops(live_ops));
+        println!("  Ops limit      : {}", format_ops(cfg.plan.ops_per_month));
+        println!("  Ops used       : {:.1}%", pct_used);
 
-    if overage_ops > 0 {
-        println!();
-        println!("  OVERAGE: {} ops at ${}/op = ${:.2}",
-            format_ops(overage_ops), cfg.plan.rate_per_op, overage_cost);
+        let bar_width = 40;
+        let filled = (pct_used / 100.0 * bar_width as f64).min(bar_width as f64) as usize;
+        let empty = bar_width - filled;
+        println!("  [{}{}]", "#".repeat(filled), "-".repeat(empty));
+
+        if live_ops > cfg.plan.ops_per_month {
+            let overage = live_ops - cfg.plan.ops_per_month;
+            let cost = overage as f64 * cfg.plan.rate_per_op;
+            println!("  Ops overage    : {} = ${:.2}", format_ops(overage), cost);
+        }
     }
 
-    let remaining = cfg.plan.ops_per_month.saturating_sub(live_ops);
+    // Memory section
     println!();
-    println!("  Remaining      : {}", format_ops(remaining));
-    println!("  Rate per op    : {}", format_rate(cfg.plan.rate_per_op));
+    if memory_bytes > 0 {
+        if memory_gb >= 1.0 {
+            println!("  Memory used    : {:.2} GB", memory_gb);
+        } else {
+            println!("  Memory used    : {:.1} MB", memory_bytes as f64 / (1024.0 * 1024.0));
+        }
+    } else {
+        println!("  Memory used    : (daemon not running)");
+    }
 
-    if cfg.plan.tier == "free" && pct_used > 80.0 {
-        println!();
-        println!("  Approaching limit. Upgrade: cachee plan upgrade starter");
+    if cfg.plan.tier == "unlimited" {
+        let cap_tb: f64 = 10.0;
+        let overage_rate = 5000.0; // $5,000/TB/mo
+        println!("  Memory cap     : {:.0} TB included", cap_tb);
+        if memory_tb > cap_tb {
+            let overage_tb = memory_tb - cap_tb;
+            let overage_cost = overage_tb * overage_rate;
+            println!("  Memory overage : {:.2} TB x $5,000 = ${:.0}/mo", overage_tb, overage_cost);
+        } else {
+            println!("  Memory headroom: {:.2} TB remaining", cap_tb - memory_tb);
+        }
+    }
+
+    // Keys and hit rate
+    if keys > 0 {
+        println!("  Cached keys    : {}", format_ops(keys));
+    }
+    if hit_rate > 0.0 {
+        println!("  Hit rate       : {:.1}%", hit_rate);
+    }
+
+    // Billing summary
+    println!();
+    match cfg.plan.tier.as_str() {
+        "free" => {
+            let pct = if cfg.plan.ops_per_month > 0 { live_ops as f64 / cfg.plan.ops_per_month as f64 * 100.0 } else { 0.0 };
+            if pct > 80.0 {
+                println!("  Approaching free tier limit.");
+                println!("  Upgrade: cachee plan upgrade starter");
+            } else {
+                println!("  Free tier: {} remaining", format_ops(cfg.plan.ops_per_month.saturating_sub(live_ops)));
+            }
+        }
+        "payg" => {
+            let cost = live_ops as f64 / 1_000_000.0 * 15.0;
+            println!("  Estimated bill : ${:.2} ({} x $15/1M)", cost, format_ops(live_ops));
+        }
+        "unlimited" => {
+            let base = 99_999.0;
+            let mem_overage = if memory_tb > 10.0 { (memory_tb - 10.0) * 5000.0 } else { 0.0 };
+            println!("  Base fee       : $99,999");
+            if mem_overage > 0.0 {
+                println!("  Memory overage : ${:.0}", mem_overage);
+                println!("  Estimated bill : ${:.0}", base + mem_overage);
+            } else {
+                println!("  Estimated bill : $99,999 (no overage)");
+            }
+        }
+        _ => {
+            if cfg.plan.ops_per_month > 0 && live_ops > cfg.plan.ops_per_month {
+                let overage = live_ops - cfg.plan.ops_per_month;
+                let cost = overage as f64 * cfg.plan.rate_per_op;
+                println!("  Overage cost   : ${:.2}", cost);
+            }
+        }
     }
 
     Ok(())

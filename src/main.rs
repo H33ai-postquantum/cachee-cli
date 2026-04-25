@@ -37,6 +37,20 @@ mod security;
 mod diagnostics;
 mod data;
 mod signup;
+mod archive;
+mod keys;
+mod federation;
+mod lifecycle;
+mod trust;
+mod read_contract;
+mod cache_api;
+mod storage;
+mod observability;
+mod cache_slot;
+mod sdk;
+mod crypto;
+mod content_store;
+mod pq_keys;
 
 #[derive(Parser)]
 #[command(
@@ -202,11 +216,14 @@ enum Commands {
         #[arg(long, short)]
         follow: bool,
     },
-    /// Export stats to JSON
+    /// Export cached bundles to CAB files
     Export {
-        /// Output file (stdout if omitted)
+        /// Destination directory
         #[arg(long)]
-        output: Option<String>,
+        dest: String,
+        /// Export all bundles
+        #[arg(long)]
+        all: bool,
     },
 
     // ── Diagnostics ───────────────────────────────────
@@ -388,7 +405,34 @@ async fn main() -> anyhow::Result<()> {
         Commands::Bench { duration, workers } => bench::run(duration, workers).await?,
         Commands::Metrics => diagnostics::metrics().await?,
         Commands::Logs { lines, follow } => diagnostics::logs(lines, follow).await?,
-        Commands::Export { output } => diagnostics::export(output).await?,
+        Commands::Export { dest, all: _ } => {
+            let store_path = config::cachee_dir().join("content_store");
+            if !store_path.exists() {
+                println!("No content store found. Start the daemon first: cachee start");
+                return Ok(());
+            }
+            let store = content_store::ContentStore::open(&store_path)
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if store.len() == 0 {
+                println!("Content store is empty. No bundles to export.");
+                return Ok(());
+            }
+
+            let dest_path = std::path::Path::new(&dest);
+            std::fs::create_dir_all(dest_path)?;
+
+            let count = store.export_all(dest_path)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Exported {} bundles to {}", count, dest);
+            println!();
+            for addr in store.addresses().iter().take(5) {
+                println!("  {}.cab", hex::encode(&addr[..16]));
+            }
+            if store.len() > 5 {
+                println!("  ... and {} more", store.len() - 5);
+            }
+        }
 
         // Diagnostics
         Commands::Info => diagnostics::info().await?,

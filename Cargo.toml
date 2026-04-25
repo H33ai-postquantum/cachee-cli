@@ -14,6 +14,22 @@ categories = ["caching", "command-line-utilities", "cryptography"]
 name = "cachee"
 path = "src/main.rs"
 
+[[bin]]
+name = "cachee-verify"
+path = "src/bin/verify.rs"
+
+[[bin]]
+name = "cachee-gold-demo"
+path = "src/bin/gold_demo.rs"
+
+[[bin]]
+name = "gen-test-bundle"
+path = "src/bin/gen_test_bundle.rs"
+
+[[bin]]
+name = "cachee-demo"
+path = "src/bin/demo.rs"
+
 [dependencies]
 # CLI framework
 clap = { version = "4", features = ["derive", "color"] }
@@ -51,9 +67,21 @@ hdrhistogram = "7.5"
 # HTTP client (for signup/usage/plan API calls)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+# Post-quantum cryptography (real signature verification)
+pqcrypto-dilithium = "0.5"
+pqcrypto-falcon = "0.4"
+pqcrypto-sphincsplus = "0.7"
+pqcrypto-traits = "0.3"
+
+# Content-addressed storage
+sled = "0.34"
+
 # Process management
 libc = "0.2"
 anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
