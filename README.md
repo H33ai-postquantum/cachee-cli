@@ -83,7 +83,7 @@ H33.ai, Inc. · Eric Beans, CEO
 
 ---
 
-**H33 Products:** [H33-74](https://h33.ai) · [Auth1](https://auth1.ai) · [Chat101](https://chat101.ai) · [Cachee](https://cachee.ai) · [Z101](https://z101.ai) · [RevMine](https://revmine.ai) · [BotShield](https://h33.ai/botshield)
+**H33 Products:** [H33-74](https://h33.ai) · [Auth1](https://auth1.ai) · [Chat101](https://chat101.ai) · [Cachee](https://cachee.ai) · [Z101](https://z101.ai) · [RevMine](https://revmine.ai) · [BotShield](https://h33.ai/botshield) · [FundMySBA](https://fundmysba.ai)
 
 *Introducing H33-74. 74 bytes. Any computation. Post-quantum attested. Forever.*
 
@@ -101,6 +101,6 @@ H33.ai, Inc. · Eric Beans, CEO
 | [Cachee.ai](https://cachee.ai) | Sub-microsecond PQ-attested cache |
 | [Z101.ai](https://z101.ai) | 20+ SaaS products on one backend |
 | [RevMine.ai](https://revmine.ai) | Revenue intelligence platform |
-| [BotShield](https://h33.ai/botshield) | Free CAPTCHA replacement |
+| [BotShield](https://h33.ai/botshield) · [FundMySBA](https://fundmysba.ai) | Free CAPTCHA replacement |
 
 *Introducing H33-74. 74 bytes. Any computation. Post-quantum attested. Forever.*
