@@ -5,7 +5,9 @@
 use sha3::{Digest, Sha3_256};
 
 use crate::archive::ComputationFingerprint;
-use crate::lifecycle::{EntryState, TemporalBinding, TransitionAuthority, TransitionProof, ValidityWindow};
+use crate::lifecycle::{
+    EntryState, TemporalBinding, TransitionAuthority, TransitionProof, ValidityWindow,
+};
 use crate::trust::{Provenance, TrustLevel, VerificationMode};
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -42,8 +44,8 @@ pub enum WriteConflict {
     },
     /// Same result, different fingerprint — version drift
     ResultDuplicate {
-        existing_fingerprint: ComputationFingerprint,
-        incoming_fingerprint: ComputationFingerprint,
+        existing_fingerprint: Box<ComputationFingerprint>,
+        incoming_fingerprint: Box<ComputationFingerprint>,
     },
 }
 
@@ -86,8 +88,8 @@ pub fn detect_conflict(
         && existing.fingerprint.digest() != incoming_fingerprint.digest()
     {
         return WriteConflict::ResultDuplicate {
-            existing_fingerprint: existing.fingerprint.clone(),
-            incoming_fingerprint: incoming_fingerprint.clone(),
+            existing_fingerprint: Box::new(existing.fingerprint.clone()),
+            incoming_fingerprint: Box::new(incoming_fingerprint.clone()),
         };
     }
 
@@ -169,8 +171,7 @@ impl CacheSlot {
 
     /// Check if this slot's fingerprint is valid (non-empty hashes).
     pub fn has_valid_fingerprint(&self) -> bool {
-        self.fingerprint.input_hash != [0u8; 32]
-            && self.fingerprint.computation_hash != [0u8; 32]
+        self.fingerprint.input_hash != [0u8; 32] && self.fingerprint.computation_hash != [0u8; 32]
     }
 
     /// Compute content address: SHA3-256(value_hash || fingerprint.digest()).

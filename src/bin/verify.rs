@@ -1,3 +1,4 @@
+#![allow(clippy::unnecessary_map_or, clippy::redundant_closure, dead_code)]
 //! `cachee-verify` — standalone CAB bundle verification.
 //!
 //! Takes a `.cab` file as input. Outputs VALID or INVALID.
@@ -214,10 +215,16 @@ fn verify_directory(dir: &str, json_mode: bool) {
             "invalid": invalid,
             "results": results.iter().map(|r| result_to_json(r)).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
     } else {
         println!();
-        println!("  Total: {} | Valid: {} | Invalid: {}", total, valid, invalid);
+        println!(
+            "  Total: {} | Valid: {} | Invalid: {}",
+            total, valid, invalid
+        );
     }
 
     process::exit(if invalid > 0 { 1 } else { 0 });
@@ -226,7 +233,10 @@ fn verify_directory(dir: &str, json_mode: bool) {
 fn print_result(r: &BundleVerification, json_mode: bool) {
     if json_mode {
         let json = result_to_json(r);
-        println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
         return;
     }
 
@@ -234,7 +244,14 @@ fn print_result(r: &BundleVerification, json_mode: bool) {
     println!("Cachee Archive Bundle Verification");
     println!("===================================");
     println!("  File             : {}", r.file);
-    println!("  Magic            : {}", if r.magic_ok { "CAB1 (valid)" } else { "INVALID" });
+    println!(
+        "  Magic            : {}",
+        if r.magic_ok {
+            "CAB1 (valid)"
+        } else {
+            "INVALID"
+        }
+    );
     println!("  Version          : {}", r.version);
     println!("  Computation type : {}", r.computation_type);
     println!("  Timestamp        : {}", r.timestamp);
@@ -253,12 +270,27 @@ fn print_result(r: &BundleVerification, json_mode: bool) {
     }
     println!();
     println!("  Signature Verification:");
-    println!("    ML-DSA-65      : {}", if r.mldsa_valid { "PASS" } else { "FAIL" });
-    println!("    FALCON-512     : {}", if r.falcon_valid { "PASS" } else { "FAIL" });
-    println!("    SLH-DSA-128f   : {}", if r.slhdsa_valid { "PASS" } else { "FAIL" });
-    println!("    2-of-3         : {}", if r.two_of_three { "PASS" } else { "FAIL" });
+    println!(
+        "    ML-DSA-65      : {}",
+        if r.mldsa_valid { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "    FALCON-512     : {}",
+        if r.falcon_valid { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "    SLH-DSA-128f   : {}",
+        if r.slhdsa_valid { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "    2-of-3         : {}",
+        if r.two_of_three { "PASS" } else { "FAIL" }
+    );
     println!();
-    println!("  On-chain anchor  : {}", if r.on_chain_anchored { "YES" } else { "NO" });
+    println!(
+        "  On-chain anchor  : {}",
+        if r.on_chain_anchored { "YES" } else { "NO" }
+    );
     println!();
 
     // Crypto posture warnings

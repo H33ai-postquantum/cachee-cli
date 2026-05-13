@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Serde helper for `[u8; 58]` (H33 primitive) — serializes as hex string.
+#[allow(dead_code)]
 mod serde_bytes_58 {
     use serde::{self, Deserialize, Deserializer, Serializer};
 
@@ -36,6 +37,7 @@ mod serde_bytes_58 {
 }
 
 /// Serde helper for `Option<[u8; 58]>`.
+#[allow(dead_code)]
 mod serde_option_bytes_58 {
     use serde::{self, Deserialize, Deserializer, Serializer};
 
@@ -91,17 +93,20 @@ pub enum TransitionProof {
     /// Signature from the original issuer
     IssuerSignature { signature: Vec<u8> },
     /// Regulator key attestation
-    RegulatorAttestation { key_id: [u8; 32], attestation: Vec<u8> },
+    RegulatorAttestation {
+        key_id: [u8; 32],
+        attestation: Vec<u8>,
+    },
 }
 
 /// Whether a transition is reversible
 pub fn is_reversible(state: &EntryState) -> bool {
     match state {
-        EntryState::Superseded { .. } => false,  // terminal
-        EntryState::Revoked { .. } => false,      // terminal
-        EntryState::Expired { .. } => true,       // can re-validate
-        EntryState::Deprecated { .. } => true,    // can re-attest
-        EntryState::Active => true,               // can transition to anything
+        EntryState::Superseded { .. } => false, // terminal
+        EntryState::Revoked { .. } => false,    // terminal
+        EntryState::Expired { .. } => true,     // can re-validate
+        EntryState::Deprecated { .. } => true,  // can re-attest
+        EntryState::Active => true,             // can transition to anything
     }
 }
 

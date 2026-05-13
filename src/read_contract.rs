@@ -21,10 +21,19 @@ use crate::trust::Provenance;
 /// what level of verification was performed on *this specific read*.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VerificationStatus {
-    /// All three PQ signatures were verified on this read.
+    /// PQ signatures were verified on this read (2-of-3 or 3-of-3).
     FullyVerified {
         /// Unix timestamp (nanoseconds) when verification completed.
-        checked_at: u64,
+        verified_at: u64,
+        /// Whether all three families passed.
+        all_three: bool,
+        /// Whether at least 2-of-3 families passed.
+        two_of_three: bool,
+    },
+    /// Verification was attempted but failed.
+    VerificationFailed {
+        /// Why verification failed.
+        reason: String,
     },
     /// Verification result was cached from a previous read.
     CachedVerification {

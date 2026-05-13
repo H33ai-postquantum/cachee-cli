@@ -25,32 +25,35 @@
 //!   cachee sdk           — Generate client boilerplate
 //!   cachee cluster       — Federated D-Cachee operations
 
+#![allow(dead_code)]
+
 use clap::{Parser, Subcommand};
 
-mod config;
-mod daemon;
-mod resp;
-mod bench;
-mod attest;
-mod plan;
-mod security;
-mod diagnostics;
-mod data;
-mod signup;
 mod archive;
-mod keys;
-mod federation;
-mod lifecycle;
-mod trust;
-mod read_contract;
+mod attest;
+mod audit;
+mod bench;
 mod cache_api;
-mod storage;
-mod observability;
 mod cache_slot;
-mod sdk;
-mod crypto;
+mod config;
 mod content_store;
+mod crypto;
+mod daemon;
+mod data;
+mod diagnostics;
+mod federation;
+mod keys;
+mod lifecycle;
+mod observability;
+mod plan;
 mod pq_keys;
+mod read_contract;
+mod resp;
+mod sdk;
+mod security;
+mod signup;
+mod storage;
+mod trust;
 
 #[derive(Parser)]
 #[command(
@@ -131,13 +134,9 @@ enum Commands {
         receipt: bool,
     },
     /// Delete a key
-    Del {
-        key: String,
-    },
+    Del { key: String },
     /// Check remaining TTL on a key (seconds)
-    Ttl {
-        key: String,
-    },
+    Ttl { key: String },
     /// List keys matching a glob pattern
     Keys {
         /// Glob pattern (e.g. "session:*")
@@ -343,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("cachee=info".parse().unwrap())
+                .add_directive("cachee=info".parse().unwrap()),
         )
         .init();
 
@@ -357,8 +356,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Logout => signup::logout().await?,
 
         // Lifecycle
-        Commands::Init { port, max_keys, ttl } => config::init(port, max_keys, ttl).await?,
-        Commands::Start { foreground, config: config_path } => daemon::start(foreground, config_path).await?,
+        Commands::Init {
+            port,
+            max_keys,
+            ttl,
+        } => config::init(port, max_keys, ttl).await?,
+        Commands::Start {
+            foreground,
+            config: config_path,
+        } => daemon::start(foreground, config_path).await?,
         Commands::Stop => daemon::stop().await?,
         Commands::Status => daemon::status().await?,
 
@@ -381,7 +387,9 @@ async fn main() -> anyhow::Result<()> {
 
         // Security
         Commands::Auth { action } => match action {
-            AuthAction::Create { label, permissions } => security::auth_create(&label, &permissions).await?,
+            AuthAction::Create { label, permissions } => {
+                security::auth_create(&label, &permissions).await?
+            }
             AuthAction::List => security::auth_list().await?,
             AuthAction::Revoke { key_id } => security::auth_revoke(&key_id).await?,
         },
@@ -411,10 +419,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("No content store found. Start the daemon first: cachee start");
                 return Ok(());
             }
-            let store = content_store::ContentStore::open(&store_path)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let store =
+                content_store::ContentStore::open(&store_path).map_err(|e| anyhow::anyhow!(e))?;
 
-            if store.len() == 0 {
+            if store.is_empty() {
                 println!("Content store is empty. No bundles to export.");
                 return Ok(());
             }
@@ -422,7 +430,8 @@ async fn main() -> anyhow::Result<()> {
             let dest_path = std::path::Path::new(&dest);
             std::fs::create_dir_all(dest_path)?;
 
-            let count = store.export_all(dest_path)
+            let count = store
+                .export_all(dest_path)
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("Exported {} bundles to {}", count, dest);
             println!();

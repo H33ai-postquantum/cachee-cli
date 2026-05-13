@@ -8,8 +8,8 @@ pub async fn auth_create(label: &str, permissions: &str) -> anyhow::Result<()> {
     let keys_dir = config::cachee_dir().join("keys");
     std::fs::create_dir_all(&keys_dir)?;
 
-    let key_id = hex::encode(&rand::random::<[u8; 8]>());
-    let secret = hex::encode(&rand::random::<[u8; 32]>());
+    let key_id = hex::encode(rand::random::<[u8; 8]>());
+    let secret = hex::encode(rand::random::<[u8; 32]>());
 
     let key_file = keys_dir.join(format!("apikey-{key_id}.toml"));
     let content = format!(
@@ -66,7 +66,9 @@ pub async fn auth_list() -> anyhow::Result<()> {
 }
 
 pub async fn auth_revoke(key_id: &str) -> anyhow::Result<()> {
-    let key_file = config::cachee_dir().join("keys").join(format!("apikey-{key_id}.toml"));
+    let key_file = config::cachee_dir()
+        .join("keys")
+        .join(format!("apikey-{key_id}.toml"));
     if key_file.exists() {
         std::fs::remove_file(&key_file)?;
         println!("API key {key_id} revoked");
@@ -90,7 +92,7 @@ pub async fn tls_enable() -> anyhow::Result<()> {
     std::fs::write(&cert_path, "# Self-signed certificate placeholder\n# Replace with real cert: cachee tls import --cert /path/to/cert.pem --key /path/to/key.pem\n")?;
     std::fs::write(&key_path, "# Private key placeholder\n")?;
 
-    let mut cfg = config::load()?;
+    let cfg = config::load()?;
     // Would add tls_enabled field to config
     let config_path = config::cachee_dir().join("config.toml");
     let toml_str = toml::to_string_pretty(&cfg)?;
@@ -145,9 +147,22 @@ pub async fn tls_status() -> anyhow::Result<()> {
     let key_exists = tls_dir.join("key.pem").exists();
 
     println!("TLS Status");
-    println!("  Certificate : {}", if cert_exists { "present" } else { "not found" });
-    println!("  Private key : {}", if key_exists { "present" } else { "not found" });
-    println!("  Status      : {}", if cert_exists && key_exists { "ready" } else { "not configured" });
+    println!(
+        "  Certificate : {}",
+        if cert_exists { "present" } else { "not found" }
+    );
+    println!(
+        "  Private key : {}",
+        if key_exists { "present" } else { "not found" }
+    );
+    println!(
+        "  Status      : {}",
+        if cert_exists && key_exists {
+            "ready"
+        } else {
+            "not configured"
+        }
+    );
 
     if !cert_exists {
         println!();
@@ -174,7 +189,7 @@ pub async fn rotate_keys() -> anyhow::Result<()> {
     std::fs::copy(&identity_path, &archive_path)?;
 
     // Generate new key
-    let new_key_id = hex::encode(&rand::random::<[u8; 16]>());
+    let new_key_id = hex::encode(rand::random::<[u8; 16]>());
     let key_info = format!(
         "# Cachee PQ Identity\n# Generated: {}\n# Rotated from: {}\nkey_id = \"{}\"\nalgorithms = [\"ML-DSA-65\", \"FALCON-512\", \"SLH-DSA\"]\n",
         now_unix(),
@@ -185,7 +200,10 @@ pub async fn rotate_keys() -> anyhow::Result<()> {
 
     println!("PQ keypair rotated");
     println!();
-    println!("  Old key : {old_key_id} (archived at {})", archive_path.display());
+    println!(
+        "  Old key : {old_key_id} (archived at {})",
+        archive_path.display()
+    );
     println!("  New key : {new_key_id}");
     println!();
     println!("  Restart daemon: cachee stop && cachee start");
@@ -196,8 +214,9 @@ pub async fn rotate_keys() -> anyhow::Result<()> {
 
 // ── Helpers ──────────────────────────────────────────
 
-fn extract_field<'a>(content: &'a str, field: &str) -> String {
-    content.lines()
+fn extract_field(content: &str, field: &str) -> String {
+    content
+        .lines()
         .find(|l| l.starts_with(field))
         .and_then(|l| l.split('"').nth(1))
         .unwrap_or("unknown")
@@ -205,7 +224,7 @@ fn extract_field<'a>(content: &'a str, field: &str) -> String {
 }
 
 fn sha3_hash(data: &[u8]) -> [u8; 32] {
-    use sha3::{Sha3_256, Digest};
+    use sha3::{Digest, Sha3_256};
     let mut hasher = Sha3_256::new();
     hasher.update(data);
     let result = hasher.finalize();

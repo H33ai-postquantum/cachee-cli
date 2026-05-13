@@ -37,13 +37,15 @@ pub struct CacheeConfig {
     /// Flows into CacheSlot provenance and SignerIdentity.
     #[serde(default = "default_issuer_id")]
     pub issuer_id: String,
+    /// Whether the daemon requires AUTH before accepting commands.
+    /// When true, clients must send AUTH <api_key> before any other command.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 /// Default issuer ID — from env or process ID.
 fn default_issuer_id() -> String {
-    std::env::var("CACHEE_ISSUER_ID").unwrap_or_else(|_| {
-        format!("cachee-{}", std::process::id())
-    })
+    std::env::var("CACHEE_ISSUER_ID").unwrap_or_else(|_| format!("cachee-{}", std::process::id()))
 }
 
 /// Billing plan configuration.
@@ -111,7 +113,9 @@ pub struct VerificationConfig {
     pub allow_unsigned_federation: bool,
 }
 
-fn default_write_policy() -> String { "allow_unsigned".to_string() }
+fn default_write_policy() -> String {
+    "allow_unsigned".to_string()
+}
 
 /// Default verification mode: trust cached results without re-verifying.
 fn default_verification_mode() -> String {
@@ -173,6 +177,7 @@ impl Default for CacheeConfig {
             },
             verification: VerificationConfig::default(),
             issuer_id: default_issuer_id(),
+            require_auth: false,
         }
     }
 }
@@ -205,7 +210,7 @@ pub async fn init(port: u16, max_keys: usize, ttl: u32) -> anyhow::Result<()> {
     std::fs::write(&config_path, &toml_str)?;
 
     // Generate PQ keypair placeholder identity
-    let key_id = hex::encode(&rand::random::<[u8; 16]>());
+    let key_id = hex::encode(rand::random::<[u8; 16]>());
     let key_info = format!(
         "# Cachee PQ Identity\n# Generated: {}\nkey_id = \"{}\"\nalgorithms = [\"ML-DSA-65\", \"FALCON-512\", \"SLH-DSA\"]\n",
         chrono_placeholder(),
@@ -214,10 +219,12 @@ pub async fn init(port: u16, max_keys: usize, ttl: u32) -> anyhow::Result<()> {
     std::fs::write(dir.join("keys").join("identity.toml"), &key_info)?;
 
     // Generate real PQ keypairs
-    use crate::pq_keys::{PqKeySet, CryptoPosture};
+    use crate::pq_keys::{CryptoPosture, PqKeySet};
     let pq_keys = PqKeySet::generate(CryptoPosture::Production);
     let keys_path = dir.join("keys");
-    pq_keys.save(&keys_path).map_err(|e| anyhow::anyhow!("PQ keygen failed: {}", e))?;
+    pq_keys
+        .save(&keys_path)
+        .map_err(|e| anyhow::anyhow!("PQ keygen failed: {}", e))?;
 
     println!("Cachee initialized at {}", dir.display());
     println!();

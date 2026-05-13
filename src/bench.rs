@@ -1,8 +1,8 @@
 //! `cachee bench` — built-in throughput/latency benchmark.
 
 use cachee_core::{CacheeEngine, EngineConfig, L0Config};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub async fn run(duration_secs: u64, workers: usize) -> anyhow::Result<()> {
@@ -14,7 +14,11 @@ pub async fn run(duration_secs: u64, workers: usize) -> anyhow::Result<()> {
     let engine = Arc::new(CacheeEngine::new(EngineConfig {
         max_keys: 1_000_000,
         default_ttl: 3600,
-        l0: L0Config { enabled: true, max_keys: 100_000, shards: 64 },
+        l0: L0Config {
+            enabled: true,
+            max_keys: 100_000,
+            shards: 64,
+        },
         ..Default::default()
     }));
 
@@ -44,7 +48,9 @@ pub async fn run(duration_secs: u64, workers: usize) -> anyhow::Result<()> {
         let mut prev = 0u64;
         for sec in 1..=duration_secs {
             std::thread::sleep(Duration::from_secs(1));
-            if report_stop.load(Ordering::Relaxed) { break; }
+            if report_stop.load(Ordering::Relaxed) {
+                break;
+            }
             let current = report_total.load(Ordering::Relaxed);
             println!("  {:>4}  {:>12}  {:>12}", sec, current - prev, current);
             prev = current;
@@ -64,7 +70,7 @@ pub async fn run(duration_secs: u64, workers: usize) -> anyhow::Result<()> {
                     let key_idx = (i % populate_count as u64) as usize;
                     let key = format!("bench:key:{key_idx}");
 
-                    if i % 5 == 0 {
+                    if i.is_multiple_of(5) {
                         // 20% writes
                         let value = format!("updated-{i}");
                         engine.set(key, bytes::Bytes::from(value), None);
