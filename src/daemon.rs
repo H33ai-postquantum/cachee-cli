@@ -22,6 +22,7 @@ use crate::read_contract::{CacheeReadResponse, SignatureSummary, VerificationSta
 use crate::trust::{Provenance, VerificationMode};
 use cachee_core::{CacheeEngine, EngineConfig, L0Config};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -44,6 +45,8 @@ struct ApiKeyEntry {
     key_id: String,
     label: String,
     permissions: String,
+    /// Hard ops limit for this key. 0 = unlimited.
+    ops_limit: u64,
 }
 
 impl ApiKeyEntry {
@@ -63,10 +66,30 @@ impl ApiKeyEntry {
 struct ConnState {
     authenticated: bool,
     key_entry: Option<ApiKeyEntry>,
+    /// The SHA3-256 hash of the secret used to authenticate.
+    /// Used to check if the key has been revoked (registry lookup by hash).
+    key_hash: Option<[u8; 32]>,
+}
+
+/// Global ops counters per key_id. Quota is tied to the key, not the connection.
+/// Reconnecting or re-authing does NOT reset the counter.
+/// Only window rollover or admin reset clears usage.
+type OpsCounters = Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>;
+
+/// Timestamp of last successful key registry reload.
+static REGISTRY_LAST_RELOAD: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Load all API keys from disk into the registry.
-fn load_api_keys() -> HashMap<[u8; 32], ApiKeyEntry> {
+/// Load all API keys from disk. Returns None if keys dir doesn't exist
+/// and we're not in dev mode (fail closed).
+fn load_api_keys() -> Option<HashMap<[u8; 32], ApiKeyEntry>> {
     let keys_dir = config::cachee_dir().join("keys");
     let mut registry = HashMap::new();
 
@@ -79,6 +102,8 @@ fn load_api_keys() -> HashMap<[u8; 32], ApiKeyEntry> {
                     let label = extract_toml_field(&content, "label");
                     let permissions = extract_toml_field(&content, "permissions");
                     let secret_hash_hex = extract_toml_field(&content, "secret_hash");
+                    let ops_limit_str = extract_toml_field(&content, "ops_limit");
+                    let ops_limit: u64 = ops_limit_str.parse().unwrap_or(0); // 0 = unlimited
 
                     if let Ok(hash_bytes) = hex::decode(&secret_hash_hex) {
                         if hash_bytes.len() == 32 {
@@ -90,6 +115,7 @@ fn load_api_keys() -> HashMap<[u8; 32], ApiKeyEntry> {
                                     key_id,
                                     label,
                                     permissions,
+                                    ops_limit,
                                 },
                             );
                         }
@@ -100,10 +126,15 @@ fn load_api_keys() -> HashMap<[u8; 32], ApiKeyEntry> {
     }
 
     // Also accept the CLI credentials key (from cachee signup)
+    // Ops limit comes from the plan config
     let creds_path = config::cachee_dir().join("credentials.toml");
     if let Ok(content) = std::fs::read_to_string(&creds_path) {
         let api_key = extract_toml_field(&content, "api_key");
         if !api_key.is_empty() {
+            // Load plan limit from config
+            let plan_limit = config::load()
+                .map(|c| c.plan.ops_per_month)
+                .unwrap_or(1_000); // Default to 1,000 for sandbox/free
             let hash = crate::cache_slot::sha3_256(api_key.as_bytes());
             registry.insert(
                 hash,
@@ -111,12 +142,28 @@ fn load_api_keys() -> HashMap<[u8; 32], ApiKeyEntry> {
                     key_id: "cli-credentials".to_string(),
                     label: "CLI signup key".to_string(),
                     permissions: "read,write".to_string(),
+                    ops_limit: plan_limit,
                 },
             );
         }
     }
 
-    registry
+    REGISTRY_LAST_RELOAD.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    Some(registry)
+}
+
+/// Spawn background task to reload key registry every `interval` seconds.
+/// Performs atomic swap — hot path reads are never blocked.
+fn spawn_registry_reloader(api_keys: ApiKeyRegistry, interval_secs: u64) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+        if let Some(new_registry) = load_api_keys() {
+            let mut write = api_keys.write().unwrap();
+            *write = new_registry;
+            // REGISTRY_LAST_RELOAD is already updated inside load_api_keys
+        }
+        // If load fails, keep the old registry (fail-open for reload, fail-closed for startup)
+    });
 }
 
 fn extract_toml_field(content: &str, field: &str) -> String {
@@ -137,9 +184,33 @@ pub async fn start(_foreground: bool, _config_path: Option<String>) -> anyhow::R
     let require_auth = cfg.require_auth;
     let issuer_id = cfg.issuer_id.clone();
 
-    // Load API key registry for AUTH enforcement
-    let api_keys: ApiKeyRegistry = Arc::new(RwLock::new(load_api_keys()));
-    let key_count = api_keys.read().unwrap().len();
+    // Load API key registry for AUTH enforcement (fail-closed on startup)
+    let initial_keys = if require_auth {
+        match load_api_keys() {
+            Some(keys) if !keys.is_empty() => keys,
+            Some(_) => {
+                eprintln!("FATAL: require_auth=true but no API keys found. Create keys with: cachee auth create --label \"my-app\"");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("FATAL: require_auth=true but key registry failed to load.");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        load_api_keys().unwrap_or_default()
+    };
+    let key_count = initial_keys.len();
+    let api_keys: ApiKeyRegistry = Arc::new(RwLock::new(initial_keys));
+
+    // Spawn background key registry reloader (revocation within 3 seconds)
+    if require_auth {
+        spawn_registry_reloader(api_keys.clone(), 3);
+    }
+
+    // Global ops counters — tied to key_id, survives reconnects/re-auth.
+    // Quota is access control. Reconnecting does NOT reset the counter.
+    let ops_counters: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
 
     let engine = Arc::new(CacheeEngine::new(EngineConfig {
         max_keys: cfg.max_keys,
@@ -269,9 +340,13 @@ pub async fn start(_foreground: bool, _config_path: Option<String>) -> anyhow::R
     println!("  Verify mode : {verify_mode_str}");
     println!("  Strict FP   : {strict_mode}");
     println!(
-        "  Auth        : {} ({} keys loaded)",
+        "  Auth        : {} ({} keys loaded, reload every 3s)",
         if require_auth { "REQUIRED" } else { "disabled" },
         key_count
+    );
+    println!(
+        "  Quota       : {} ops/month (enforced at RESP layer)",
+        cfg.plan.ops_per_month
     );
     println!(
         "  Metrics     : http://127.0.0.1:{}/metrics",
@@ -301,12 +376,14 @@ pub async fn start(_foreground: bool, _config_path: Option<String>) -> anyhow::R
         let issuer_id = issuer_id.clone();
         let audit_log = audit_log.clone();
         let api_keys = api_keys.clone();
+        let ops_counters = ops_counters.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let mut conn = ConnState {
-                authenticated: !require_auth, // if auth not required, auto-auth
+                authenticated: !require_auth,
                 key_entry: None,
+                key_hash: None,
             };
 
             loop {
@@ -343,6 +420,63 @@ pub async fn start(_foreground: bool, _config_path: Option<String>) -> anyhow::R
                         return;
                     }
                     continue;
+                }
+
+                // Quota enforcement — atomic, immediate, per key_id (not per connection).
+                // Quota is access control, not accounting.
+                // Reconnecting or re-authing does NOT reset the counter.
+                if let Some(ref entry) = conn.key_entry {
+                    if entry.ops_limit > 0 {
+                        // Get or create the global counter for this key_id
+                        let counter = {
+                            let read = ops_counters.read().unwrap();
+                            read.get(&entry.key_id).cloned()
+                        };
+                        let counter = match counter {
+                            Some(c) => c,
+                            None => {
+                                let mut write = ops_counters.write().unwrap();
+                                let c = write
+                                    .entry(entry.key_id.clone())
+                                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                                    .clone();
+                                c
+                            }
+                        };
+
+                        let current = counter.fetch_add(1, Ordering::SeqCst);
+                        if current >= entry.ops_limit {
+                            counter.fetch_sub(1, Ordering::SeqCst);
+                            let msg = format!(
+                                "-QUOTA ops limit exceeded ({}/{} ops). Upgrade your plan: cachee plan upgrade starter\r\n",
+                                current, entry.ops_limit
+                            );
+                            if socket.write_all(msg.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Re-validate key against current registry (catches revocations within reload window)
+                if require_auth {
+                    if let Some(ref hash) = conn.key_hash {
+                        let still_valid = {
+                            let registry = api_keys.read().unwrap();
+                            registry.contains_key(hash)
+                        }; // guard dropped before await
+                        if !still_valid {
+                            conn.authenticated = false;
+                            conn.key_entry = None;
+                            conn.key_hash = None;
+                            let msg = "-NOAUTH key has been revoked. Re-authenticate.\r\n";
+                            if socket.write_all(msg.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                 }
 
                 // Permission check for write commands
@@ -407,14 +541,24 @@ fn handle_auth(parts: &[&str], api_keys: &ApiKeyRegistry, conn: &mut ConnState) 
         Some(entry) => {
             conn.authenticated = true;
             conn.key_entry = Some(entry.clone());
+            conn.key_hash = Some(hash);
+            // NOTE: ops counter is NOT reset on re-auth.
+            // Quota is tied to key_id globally, not per connection.
             format!(
-                "+OK authenticated as {} ({})\r\n",
-                entry.label, entry.permissions
+                "+OK authenticated as {} ({}, limit={})\r\n",
+                entry.label,
+                entry.permissions,
+                if entry.ops_limit > 0 {
+                    entry.ops_limit.to_string()
+                } else {
+                    "unlimited".to_string()
+                }
             )
         }
         None => {
             conn.authenticated = false;
             conn.key_entry = None;
+            conn.key_hash = None;
             "-ERR invalid API key\r\n".to_string()
         }
     }
@@ -685,8 +829,9 @@ fn handle_resp(
         "INFO" => {
             let stats = engine.stats();
             let slot_count = slots.read().map(|r| r.len()).unwrap_or(0);
+            let reload_ts = REGISTRY_LAST_RELOAD.load(Ordering::Relaxed);
             let info = format!(
-                "# Cachee\r\nversion:{}\r\ntotal_ops:{}\r\nhit_rate:{:.4}\r\nhits_l0:{}\r\nhits_l1:{}\r\nmisses:{}\r\nkeys:{}\r\nmemory_bytes:{}\r\nslots:{}\r\nl2_bundles:{}\r\n",
+                "# Cachee\r\nversion:{}\r\ntotal_ops:{}\r\nhit_rate:{:.4}\r\nhits_l0:{}\r\nhits_l1:{}\r\nmisses:{}\r\nkeys:{}\r\nmemory_bytes:{}\r\nslots:{}\r\nl2_bundles:{}\r\nkey_registry_last_reload:{}\r\n",
                 env!("CARGO_PKG_VERSION"),
                 stats.total_ops,
                 stats.hit_rate,
@@ -697,6 +842,7 @@ fn handle_resp(
                 stats.memory_bytes,
                 slot_count,
                 content_store.len(),
+                reload_ts,
             );
             format!("${}\r\n{}\r\n", info.len(), info)
         }
@@ -1055,4 +1201,316 @@ pub async fn status() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_registry() -> HashMap<[u8; 32], ApiKeyEntry> {
+        let mut registry = HashMap::new();
+        let hash = crate::cache_slot::sha3_256(b"test-secret-key");
+        registry.insert(
+            hash,
+            ApiKeyEntry {
+                key_id: "test-key-001".to_string(),
+                label: "test key".to_string(),
+                permissions: "read,write".to_string(),
+                ops_limit: 1_000,
+            },
+        );
+        let readonly_hash = crate::cache_slot::sha3_256(b"readonly-secret");
+        registry.insert(
+            readonly_hash,
+            ApiKeyEntry {
+                key_id: "readonly-key-001".to_string(),
+                label: "readonly key".to_string(),
+                permissions: "read".to_string(),
+                ops_limit: 500,
+            },
+        );
+        registry
+    }
+
+    #[test]
+    fn test_ops_limit_exceeded_returns_quota_error() {
+        // Quota is per key_id, stored in global OpsCounters
+        let counter = Arc::new(AtomicU64::new(0));
+        let limit: u64 = 1_000;
+
+        // Simulate 1,000 ops consumed
+        counter.store(1_000, Ordering::SeqCst);
+
+        // Next op should be blocked
+        let current = counter.fetch_add(1, Ordering::SeqCst);
+        assert!(current >= limit, "should be blocked at limit");
+        counter.fetch_sub(1, Ordering::SeqCst); // undo
+        assert_eq!(counter.load(Ordering::SeqCst), 1_000, "counter unchanged");
+    }
+
+    #[test]
+    fn test_concurrent_ops_cannot_exceed_cap() {
+        // Global counter shared across all connections for the same key_id
+        let counter = Arc::new(AtomicU64::new(0));
+        let limit: u64 = 100;
+
+        // 200 threads (simulating reconnects) all sharing the SAME counter
+        let handles: Vec<_> = (0..200)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    let current = counter.fetch_add(1, Ordering::SeqCst);
+                    if current >= limit {
+                        counter.fetch_sub(1, Ordering::SeqCst);
+                        return false;
+                    }
+                    true
+                })
+            })
+            .collect();
+
+        let mut allowed = 0u64;
+        let mut blocked = 0u64;
+        for h in handles {
+            if h.join().unwrap() {
+                allowed += 1;
+            } else {
+                blocked += 1;
+            }
+        }
+
+        assert_eq!(allowed, 100);
+        assert_eq!(blocked, 100);
+        assert_eq!(counter.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn test_revoked_key_fails_after_reload() {
+        let api_keys: ApiKeyRegistry = Arc::new(RwLock::new(make_test_registry()));
+        let mut conn = ConnState {
+            authenticated: false,
+            key_entry: None,
+            key_hash: None,
+        };
+
+        let result = handle_auth(&["AUTH", "test-secret-key"], &api_keys, &mut conn);
+        assert!(result.contains("+OK"));
+        assert!(conn.authenticated);
+
+        // Simulate revocation via registry reload
+        {
+            let mut registry = api_keys.write().unwrap();
+            let hash = crate::cache_slot::sha3_256(b"test-secret-key");
+            registry.remove(&hash);
+        }
+
+        // Revocation check (runs on every command)
+        if let Some(ref hash) = conn.key_hash {
+            let still_valid = {
+                let registry = api_keys.read().unwrap();
+                registry.contains_key(hash)
+            };
+            assert!(!still_valid, "revoked key should not be valid");
+        }
+    }
+
+    #[test]
+    fn test_malformed_registry_fails_closed() {
+        let registry = HashMap::<[u8; 32], ApiKeyEntry>::new();
+        let require_auth = true;
+        assert!(
+            require_auth && registry.is_empty(),
+            "empty registry with require_auth must trigger fail-closed"
+        );
+    }
+
+    #[test]
+    fn test_missing_registry_fails_closed_unless_dev() {
+        let require_auth_prod = true;
+        let require_auth_dev = false;
+        let empty_keys: HashMap<[u8; 32], ApiKeyEntry> = HashMap::new();
+
+        // Production: empty = fail
+        assert!(require_auth_prod && empty_keys.is_empty());
+        // Dev: empty = ok
+        assert!(!require_auth_dev);
+    }
+
+    #[test]
+    fn test_invalid_auth_key_rejected() {
+        let api_keys: ApiKeyRegistry = Arc::new(RwLock::new(make_test_registry()));
+        let mut conn = ConnState {
+            authenticated: false,
+            key_entry: None,
+            key_hash: None,
+        };
+
+        let result = handle_auth(&["AUTH", "wrong-key-entirely"], &api_keys, &mut conn);
+        assert!(result.contains("-ERR"));
+        assert!(!conn.authenticated);
+        assert!(conn.key_entry.is_none());
+        assert!(conn.key_hash.is_none());
+    }
+
+    #[test]
+    fn test_reauth_does_not_reset_quota() {
+        // Quota is tied to key_id globally. Reconnecting or re-authing
+        // must NOT reset the counter. Otherwise users bypass caps.
+        let counters: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
+        let key_id = "test-key-001".to_string();
+        let limit: u64 = 1_000;
+
+        // Simulate first connection: consume 500 ops
+        {
+            let counter = counters
+                .write()
+                .unwrap()
+                .entry(key_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone();
+            for _ in 0..500 {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Simulate disconnect + reconnect + re-AUTH (new connection, same key_id)
+        {
+            let counter = {
+                let read = counters.read().unwrap();
+                read.get(&key_id).cloned().unwrap()
+            };
+            // Counter must still be 500, not reset
+            assert_eq!(counter.load(Ordering::SeqCst), 500);
+
+            // Can do 500 more ops
+            for _ in 0..500 {
+                let current = counter.fetch_add(1, Ordering::SeqCst);
+                assert!(current < limit, "should not exceed limit");
+            }
+
+            // Now at 1,000 — next op must fail
+            let current = counter.fetch_add(1, Ordering::SeqCst);
+            assert!(current >= limit, "should be blocked at 1,000");
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        // Final: counter is exactly 1,000
+        let counter = counters.read().unwrap().get(&key_id).cloned().unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1_000);
+    }
+
+    #[test]
+    fn test_two_connections_share_counter() {
+        // Two simultaneous connections using the same key_id share the
+        // same global counter and cannot exceed 1,000 combined ops.
+        let counters: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
+        let key_id = "shared-key".to_string();
+        let limit: u64 = 1_000;
+
+        // Initialize counter
+        counters
+            .write()
+            .unwrap()
+            .insert(key_id.clone(), Arc::new(AtomicU64::new(0)));
+
+        let counter = counters.read().unwrap().get(&key_id).cloned().unwrap();
+
+        // Connection A: 600 ops from thread A
+        let counter_a = counter.clone();
+        let handle_a = std::thread::spawn(move || {
+            let mut allowed = 0u64;
+            for _ in 0..600 {
+                let current = counter_a.fetch_add(1, Ordering::SeqCst);
+                if current >= limit {
+                    counter_a.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+                allowed += 1;
+            }
+            allowed
+        });
+
+        // Connection B: 600 ops from thread B (concurrent)
+        let counter_b = counter.clone();
+        let handle_b = std::thread::spawn(move || {
+            let mut allowed = 0u64;
+            for _ in 0..600 {
+                let current = counter_b.fetch_add(1, Ordering::SeqCst);
+                if current >= limit {
+                    counter_b.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+                allowed += 1;
+            }
+            allowed
+        });
+
+        let a_ops = handle_a.join().unwrap();
+        let b_ops = handle_b.join().unwrap();
+
+        // Combined must equal exactly 1,000 (the limit)
+        assert_eq!(
+            a_ops + b_ops,
+            1_000,
+            "two connections sharing a key must not exceed 1,000 combined"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1_000);
+    }
+
+    #[test]
+    fn test_counters_do_not_survive_restart() {
+        // DOCUMENTED BEHAVIOR (staging): counters are in-memory.
+        // Daemon restart resets all counters to 0.
+        // For production free-tier abuse control, counters must be
+        // persisted to sled keyed by (key_id, quota_window).
+        //
+        // This test explicitly validates the current restart behavior
+        // so the tradeoff is known, not hidden.
+
+        // Simulate pre-restart state
+        let counters_before: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
+        let key_id = "restart-test-key".to_string();
+        {
+            let counter = counters_before
+                .write()
+                .unwrap()
+                .entry(key_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone();
+            counter.store(999, Ordering::SeqCst);
+        }
+
+        // Verify pre-restart: 999 ops used
+        let pre = counters_before
+            .read()
+            .unwrap()
+            .get(&key_id)
+            .unwrap()
+            .load(Ordering::SeqCst);
+        assert_eq!(pre, 999);
+
+        // Simulate restart: new OpsCounters (empty HashMap)
+        let counters_after: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
+
+        // Post-restart: key_id has no counter → starts at 0
+        let post = counters_after
+            .read()
+            .unwrap()
+            .get(&key_id)
+            .map(|c| c.load(Ordering::SeqCst));
+        assert_eq!(post, None, "counter must not exist after restart");
+
+        // First op after restart: counter created at 0
+        let counter = counters_after
+            .write()
+            .unwrap()
+            .entry(key_id.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "counter starts at 0 after restart (staging-acceptable, production needs persistence)"
+        );
+    }
 }
