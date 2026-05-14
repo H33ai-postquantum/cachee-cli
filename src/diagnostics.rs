@@ -10,8 +10,17 @@ pub async fn info() -> anyhow::Result<()> {
     println!();
     println!("  Version    : {}", env!("CARGO_PKG_VERSION"));
     println!("  Arch       : {}", std::env::consts::ARCH);
-    println!("  OS         : {} {}", std::env::consts::OS, std::env::consts::FAMILY);
-    println!("  CPUs       : {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    println!(
+        "  OS         : {} {}",
+        std::env::consts::OS,
+        std::env::consts::FAMILY
+    );
+    println!(
+        "  CPUs       : {}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    );
     println!("  Config dir : {}", config::cachee_dir().display());
 
     if let Some(cfg) = cfg {
@@ -23,7 +32,10 @@ pub async fn info() -> anyhow::Result<()> {
         println!("  L0 enabled : {}", cfg.l0_enabled);
         println!("  L0 shards  : {}", cfg.l0_shards);
         println!("  Attest     : {}", cfg.attest_enabled);
-        println!("  Plan       : {} ({} ops/month)", cfg.plan.tier, cfg.plan.ops_per_month);
+        println!(
+            "  Plan       : {} ({} ops/month)",
+            cfg.plan.tier, cfg.plan.ops_per_month
+        );
     } else {
         println!();
         println!("  Not initialized. Run: cachee init");
@@ -116,19 +128,145 @@ pub async fn doctor() -> anyhow::Result<()> {
         if cfg.plan.tier == "free" {
             println!("  [--] Free plan (10M ops/month). Upgrade: cachee plan upgrade starter");
         } else {
-            println!("  [OK] Plan: {} ({} ops/month)", cfg.plan.tier, cfg.plan.ops_per_month);
+            println!(
+                "  [OK] Plan: {} ({} ops/month)",
+                cfg.plan.tier, cfg.plan.ops_per_month
+            );
         }
     }
 
-    // Check Rust version
-    println!("  [OK] Rust binary compiled for {}-{}", std::env::consts::ARCH, std::env::consts::OS);
+    // Check PQ keypairs (real crypto keys, not just identity.toml)
+    let keys_path = config::cachee_dir().join("keys");
+    let has_mldsa = keys_path.join("mldsa65.key").exists();
+    let has_falcon = keys_path.join("falcon512.key").exists();
+    let has_slhdsa = keys_path.join("slhdsa128f.key").exists();
+    if has_mldsa && has_falcon && has_slhdsa {
+        println!("  [OK] PQ keys loaded (ML-DSA-65 + FALCON-512 + SLH-DSA)");
+    } else {
+        let missing: Vec<&str> = [
+            (!has_mldsa, "ML-DSA-65"),
+            (!has_falcon, "FALCON-512"),
+            (!has_slhdsa, "SLH-DSA"),
+        ]
+        .iter()
+        .filter(|(m, _)| *m)
+        .map(|(_, n)| *n)
+        .collect();
+        println!(
+            "  [!!] Missing PQ keys: {}. Run: cachee init",
+            missing.join(", ")
+        );
+        issues += 1;
+    }
 
-    // Check disk space
+    // Check audit chain integrity
+    let audit_path = config::cachee_dir().join("audit_log");
+    if audit_path.exists() {
+        match crate::audit::AuditLog::open(&audit_path, "doctor") {
+            Ok(log) => match log.verify_chain() {
+                Ok((count, None)) => {
+                    println!(
+                        "  [OK] Audit chain intact ({} entries, head={})",
+                        count,
+                        hex::encode(&log.head()[..8])
+                    );
+                }
+                Ok((count, Some(broken_at))) => {
+                    println!(
+                        "  [!!] Audit chain BROKEN at sequence {} ({} entries before break)",
+                        broken_at, count
+                    );
+                    issues += 1;
+                }
+                Err(e) => {
+                    println!("  [!!] Audit chain verify error: {}", e);
+                    issues += 1;
+                }
+            },
+            Err(e) => {
+                println!("  [!!] Cannot open audit log: {}", e);
+                issues += 1;
+            }
+        }
+    } else {
+        println!("  [--] No audit log (created on first cachee start)");
+    }
+
+    // Check credentials
+    let creds_path = config::cachee_dir().join("credentials.toml");
+    if creds_path.exists() {
+        let content = std::fs::read_to_string(&creds_path).unwrap_or_default();
+        let api_key = content
+            .lines()
+            .find(|l| l.starts_with("api_key"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("");
+        if api_key.starts_with("ck_live_") && api_key.len() == 40 {
+            println!("  [OK] API key configured ({}...)", &api_key[..16]);
+        } else if !api_key.is_empty() {
+            println!(
+                "  [??] API key format unexpected: {}...",
+                &api_key[..api_key.len().min(12)]
+            );
+        } else {
+            println!("  [--] No API key. Run: cachee signup --email you@company.com");
+        }
+    } else {
+        println!("  [--] Not signed up. Run: cachee signup --email you@company.com");
+    }
+
+    // Check Auth1 reachability
+    let auth1_url = std::env::var("AUTH1_PROXY_BASE")
+        .unwrap_or_else(|_| "https://auth-api.z101.ai".to_string());
+    match reqwest::Client::new()
+        .get(format!("{}/health", auth1_url))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("  [OK] Auth1 reachable ({})", auth1_url);
+        }
+        Ok(resp) => {
+            println!("  [??] Auth1 responded {} ({})", resp.status(), auth1_url);
+        }
+        Err(_) => {
+            println!(
+                "  [!!] Auth1 unreachable ({}). Usage reporting will fail.",
+                auth1_url
+            );
+            issues += 1;
+        }
+    }
+
+    // Check content store
+    let store_path = config::cachee_dir().join("content_store");
+    if store_path.exists() {
+        match crate::content_store::ContentStore::open(&store_path) {
+            Ok(store) => {
+                println!("  [OK] Content store: {} bundles", store.len());
+            }
+            Err(e) => {
+                println!("  [!!] Content store error: {}", e);
+                issues += 1;
+            }
+        }
+    } else {
+        println!("  [--] No content store (created on first cachee start)");
+    }
+
+    // Binary info
+    println!(
+        "  [OK] Cachee v{} ({}-{})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
     println!("  [OK] Data dir: {}", config::cachee_dir().display());
 
     println!();
     if issues == 0 {
-        println!("  No issues found.");
+        println!("  All checks passed. No issues found.");
     } else {
         println!("  {} issue(s) found. See above.", issues);
     }
@@ -140,7 +278,8 @@ pub async fn metrics() -> anyhow::Result<()> {
     let cfg = config::load()?;
     let addr = format!("127.0.0.1:{}", cfg.port);
 
-    let mut stream = tokio::net::TcpStream::connect(&addr).await
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
         .map_err(|_| anyhow::anyhow!("Cannot connect to Cachee on {addr}. Is it running?"))?;
 
     stream.write_all(b"INFO\r\n").await?;
@@ -208,7 +347,10 @@ pub async fn logs(lines: usize, follow: bool) -> anyhow::Result<()> {
     }
 
     if follow {
-        println!("(follow mode not yet implemented — use: tail -f {})", log_path.display());
+        println!(
+            "(follow mode not yet implemented — use: tail -f {})",
+            log_path.display()
+        );
     }
 
     Ok(())
@@ -218,7 +360,8 @@ pub async fn export(output: Option<String>) -> anyhow::Result<()> {
     let cfg = config::load()?;
     let addr = format!("127.0.0.1:{}", cfg.port);
 
-    let mut stream = tokio::net::TcpStream::connect(&addr).await
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
         .map_err(|_| anyhow::anyhow!("Cannot connect to Cachee on {addr}. Is it running?"))?;
 
     stream.write_all(b"INFO\r\n").await?;
@@ -228,13 +371,21 @@ pub async fn export(output: Option<String>) -> anyhow::Result<()> {
 
     // Build JSON from INFO response
     let mut map = serde_json::Map::new();
-    map.insert("version".to_string(), serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()));
-    map.insert("plan".to_string(), serde_json::Value::String(cfg.plan.tier.clone()));
+    map.insert(
+        "version".to_string(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
+    map.insert(
+        "plan".to_string(),
+        serde_json::Value::String(cfg.plan.tier.clone()),
+    );
 
     for line in info.lines() {
         if let Some((key, val)) = line.split_once(':') {
             let k = key.trim().to_string();
-            if k.is_empty() || k.starts_with('#') || k.starts_with('$') { continue; }
+            if k.is_empty() || k.starts_with('#') || k.starts_with('$') {
+                continue;
+            }
             if let Ok(n) = val.trim().parse::<u64>() {
                 map.insert(k, serde_json::Value::Number(n.into()));
             } else if let Ok(f) = val.trim().parse::<f64>() {
@@ -263,14 +414,20 @@ pub async fn export(output: Option<String>) -> anyhow::Result<()> {
 pub async fn sdk_init(lang: &str, output: &str) -> anyhow::Result<()> {
     let valid = ["rust", "python", "node", "go"];
     if !valid.contains(&lang) {
-        anyhow::bail!("Unsupported language '{}'. Supported: {}", lang, valid.join(", "));
+        anyhow::bail!(
+            "Unsupported language '{}'. Supported: {}",
+            lang,
+            valid.join(", ")
+        );
     }
 
     let dir = std::path::Path::new(output);
     std::fs::create_dir_all(dir)?;
 
     let (filename, content) = match lang {
-        "rust" => ("cachee_client.rs", r#"//! Cachee Rust client — connects to local daemon via RESP.
+        "rust" => (
+            "cachee_client.rs",
+            r#"//! Cachee Rust client — connects to local daemon via RESP.
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -316,8 +473,11 @@ impl CacheeClient {
         Ok(String::from_utf8_lossy(&buf[..n]).contains(":1"))
     }
 }
-"#),
-        "python" => ("cachee_client.py", r#""""Cachee Python client — connects to local daemon via RESP."""
+"#,
+        ),
+        "python" => (
+            "cachee_client.py",
+            r#""""Cachee Python client — connects to local daemon via RESP."""
 import socket
 
 class CacheeClient:
@@ -350,8 +510,11 @@ class CacheeClient:
 # client = CacheeClient()
 # client.set("session:abc", "user123", ttl=3600)
 # value = client.get("session:abc")
-"#),
-        "node" => ("cachee-client.js", r#"/**
+"#,
+        ),
+        "node" => (
+            "cachee-client.js",
+            r#"/**
  * Cachee Node.js client — connects to local daemon via RESP.
  */
 const net = require('net');
@@ -402,8 +565,11 @@ module.exports = { CacheeClient };
 // const client = new CacheeClient();
 // await client.set('session:abc', 'user123');
 // const value = await client.get('session:abc');
-"#),
-        "go" => ("cachee_client.go", r#"// Cachee Go client — connects to local daemon via RESP.
+"#,
+        ),
+        "go" => (
+            "cachee_client.go",
+            r#"// Cachee Go client — connects to local daemon via RESP.
 package cachee
 
 import (
@@ -466,7 +632,8 @@ func (c *Client) Del(key string) (bool, error) {
 	resp, err := c.send(fmt.Sprintf("DEL %s", key))
 	return strings.Contains(resp, ":1"), err
 }
-"#),
+"#,
+        ),
         _ => unreachable!(),
     };
 

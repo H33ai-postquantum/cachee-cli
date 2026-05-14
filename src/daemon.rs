@@ -78,12 +78,97 @@ type OpsCounters = Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>;
 
 /// Timestamp of last successful key registry reload.
 static REGISTRY_LAST_RELOAD: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of last successful usage flush.
+static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Spawn background task to flush local ops counters to Auth1 every `interval` seconds.
+/// Pattern: atomic local increment (fast path) → periodic bulk flush to server (persistence).
+/// Same architecture as H33: local counter → 15s flush → Auth1 → PG.
+fn spawn_usage_flusher(ops_counters: OpsCounters, _api_keys: ApiKeyRegistry, interval_secs: u64) {
+    // We need the credentials API key to authenticate flush requests
+    let creds_path = config::cachee_dir().join("credentials.toml");
+    let api_key = std::fs::read_to_string(&creds_path)
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find(|l| l.starts_with("api_key"))
+                .and_then(|l| l.split('"').nth(1))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    if api_key.is_empty() {
+        eprintln!("[WARN] No API key for usage flush. Local metering only.");
+        return;
+    }
+
+    let auth1_base = std::env::var("AUTH1_PROXY_BASE")
+        .unwrap_or_else(|_| "https://cachee.ai/api/cachee-usage".to_string());
+    let usage_url = if auth1_base.contains("cachee.ai") {
+        auth1_base
+    } else {
+        format!("{}/api/cachee/cli/usage", auth1_base)
+    };
+
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+
+            // Collect and reset all counters atomically
+            let counters = ops_counters.read().unwrap();
+            let mut total_flushed = 0u64;
+
+            for (key_id, counter) in counters.iter() {
+                let ops = counter.swap(0, Ordering::SeqCst);
+                if ops == 0 {
+                    continue;
+                }
+
+                // Flush to Auth1/cachee.ai
+                match client
+                    .post(&usage_url)
+                    .json(&serde_json::json!({
+                        "api_key": api_key,
+                        "ops_count": ops,
+                    }))
+                    .send()
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        total_flushed += ops;
+                    }
+                    Ok(resp) => {
+                        // Flush failed — add ops back so they're not lost
+                        counter.fetch_add(ops, Ordering::SeqCst);
+                        eprintln!(
+                            "[WARN] Usage flush failed for {}: HTTP {}",
+                            key_id,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        counter.fetch_add(ops, Ordering::SeqCst);
+                        eprintln!("[WARN] Usage flush error for {}: {}", key_id, e);
+                    }
+                }
+            }
+
+            if total_flushed > 0 {
+                LAST_FLUSH.store(now_secs(), Ordering::Relaxed);
+            }
+        }
+    });
 }
 
 /// Load all API keys from disk into the registry.
@@ -211,6 +296,9 @@ pub async fn start(_foreground: bool, _config_path: Option<String>) -> anyhow::R
     // Global ops counters — tied to key_id, survives reconnects/re-auth.
     // Quota is access control. Reconnecting does NOT reset the counter.
     let ops_counters: OpsCounters = Arc::new(RwLock::new(HashMap::new()));
+
+    // Spawn background usage flusher: local counter → 15s flush → Auth1 → PG
+    spawn_usage_flusher(ops_counters.clone(), api_keys.clone(), 15);
 
     let engine = Arc::new(CacheeEngine::new(EngineConfig {
         max_keys: cfg.max_keys,
@@ -830,8 +918,9 @@ fn handle_resp(
             let stats = engine.stats();
             let slot_count = slots.read().map(|r| r.len()).unwrap_or(0);
             let reload_ts = REGISTRY_LAST_RELOAD.load(Ordering::Relaxed);
+            let flush_ts = LAST_FLUSH.load(Ordering::Relaxed);
             let info = format!(
-                "# Cachee\r\nversion:{}\r\ntotal_ops:{}\r\nhit_rate:{:.4}\r\nhits_l0:{}\r\nhits_l1:{}\r\nmisses:{}\r\nkeys:{}\r\nmemory_bytes:{}\r\nslots:{}\r\nl2_bundles:{}\r\nkey_registry_last_reload:{}\r\n",
+                "# Cachee\r\nversion:{}\r\ntotal_ops:{}\r\nhit_rate:{:.4}\r\nhits_l0:{}\r\nhits_l1:{}\r\nmisses:{}\r\nkeys:{}\r\nmemory_bytes:{}\r\nslots:{}\r\nl2_bundles:{}\r\nkey_registry_last_reload:{}\r\nlast_usage_flush:{}\r\n",
                 env!("CARGO_PKG_VERSION"),
                 stats.total_ops,
                 stats.hit_rate,
@@ -843,6 +932,7 @@ fn handle_resp(
                 slot_count,
                 content_store.len(),
                 reload_ts,
+                flush_ts,
             );
             format!("${}\r\n{}\r\n", info.len(), info)
         }

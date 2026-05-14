@@ -65,7 +65,7 @@ prometheus = "0.13"
 hdrhistogram = "7.5"
 
 # HTTP client (for signup/usage/plan API calls)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 
 # Post-quantum cryptography (real signature verification)
 pqcrypto-dilithium = "0.5"
