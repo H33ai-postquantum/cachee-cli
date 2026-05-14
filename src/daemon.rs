@@ -1241,21 +1241,140 @@ fn get_verified(
     }
 }
 
-pub async fn stop() -> anyhow::Result<()> {
+pub async fn stop(force: bool) -> anyhow::Result<()> {
+    let cfg = config::load().unwrap_or_default();
+    let port = cfg.port;
     let pid_path = config::cachee_dir().join("cachee.pid");
-    if !pid_path.exists() {
-        println!("Cachee is not running (no PID file)");
-        return Ok(());
+
+    // Step 1: Try PID file
+    let pid_from_file = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    if let Some(pid) = pid_from_file {
+        if process_is_cachee_and_listening(pid, port) {
+            kill_pid(pid, force)?;
+            std::fs::remove_file(&pid_path).ok();
+            println!("Cachee stopped (PID {pid})");
+            return Ok(());
+        } else {
+            eprintln!("Stale PID file (process {pid} is not an active Cachee listener). Removing.");
+            std::fs::remove_file(&pid_path).ok();
+        }
     }
 
-    let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: i32 = pid_str.trim().parse()?;
+    // Step 2: Find actual listener on the configured port
+    if let Some(pid) = find_listener_pid(port) {
+        // Verify it's cachee, not some other process
+        if process_is_cachee(pid) {
+            kill_pid(pid, force)?;
+            println!("Cachee stopped (PID {pid}, found via port {port})");
+            return Ok(());
+        } else {
+            let name = process_name(pid).unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "Port {port} is occupied by '{name}' (PID {pid}), not Cachee. Refusing to kill."
+            );
+            eprintln!("Use --force to kill anyway, or stop that process manually.");
+            if force {
+                kill_pid(pid, true)?;
+                println!("Force-killed PID {pid} on port {port}");
+                return Ok(());
+            }
+            return Ok(());
+        }
+    }
 
+    println!("Cachee is not running on port {port}.");
+    Ok(())
+}
+
+/// Check if a PID is a running cachee process listening on the given port.
+fn process_is_cachee_and_listening(pid: u32, port: u16) -> bool {
+    // Check process is alive
+    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+    if !alive {
+        return false;
+    }
+
+    // Check it's cachee
+    if !process_is_cachee(pid) {
+        return false;
+    }
+
+    // Check it's listening on the expected port
+    if let Some(listener_pid) = find_listener_pid(port) {
+        return listener_pid == pid;
+    }
+
+    false
+}
+
+/// Check if a PID is a cachee process (by examining the process name/cmdline).
+fn process_is_cachee(pid: u32) -> bool {
+    match process_name(pid) {
+        Some(name) => name.contains("cachee"),
+        None => false,
+    }
+}
+
+/// Get the process name/command for a PID.
+fn process_name(pid: u32) -> Option<String> {
+    // macOS: use ps
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Find the PID of the process listening on a TCP port.
+fn find_listener_pid(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().next().and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Kill a process. SIGTERM first, SIGKILL if --force.
+fn kill_pid(pid: u32, force: bool) -> anyhow::Result<()> {
+    // Send SIGTERM first (always)
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        libc::kill(pid as i32, libc::SIGTERM);
     }
-    std::fs::remove_file(&pid_path)?;
-    println!("Cachee stopped (PID {pid})");
+
+    // Wait for graceful shutdown
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Check if still alive
+    let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+
+    if still_alive && force {
+        eprintln!("SIGTERM didn't work. Sending SIGKILL...");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    } else if still_alive && !force {
+        eprintln!("Process {pid} still alive after SIGTERM. Use `cachee stop --force` to SIGKILL.");
+    }
 
     Ok(())
 }

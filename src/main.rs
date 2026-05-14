@@ -113,7 +113,11 @@ enum Commands {
         config: Option<String>,
     },
     /// Stop the running daemon
-    Stop,
+    Stop {
+        /// Force kill (SIGKILL) if SIGTERM fails
+        #[arg(long)]
+        force: bool,
+    },
     /// Show daemon status, stats, hit rate
     Status,
 
@@ -367,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
             foreground,
             config: config_path,
         } => daemon::start(foreground, config_path).await?,
-        Commands::Stop => daemon::stop().await?,
+        Commands::Stop { force } => daemon::stop(force).await?,
         Commands::Status => daemon::status().await?,
 
         // Cache operations
