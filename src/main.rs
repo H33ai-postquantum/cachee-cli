@@ -306,6 +306,8 @@ enum PlanAction {
     },
     /// Show all available plans and pricing
     List,
+    /// Sync plan from server (verify payment, update local config)
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -406,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
             PlanAction::Show => plan::show().await?,
             PlanAction::Upgrade { tier } => plan::upgrade(&tier).await?,
             PlanAction::List => plan::list().await?,
+            PlanAction::Sync => plan::sync().await?,
         },
         Commands::Usage => plan::usage().await?,
 
